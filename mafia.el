@@ -2,6 +2,14 @@
 
 ;; A roughshod port of intero.el
 
+;; Author:
+;; Maintainer:
+;; URL: https://github.com/ambiata/mafia-mode
+;; Created: 18th November 2016
+;; Version: 0.1.13
+;; Keywords: haskell, tools
+;; Package-Requires: ((emacs "24.3"))
+
 ;; Copyright (c) 2016 Ambiata
 ;; Copyright (c) 2016 Chris Done
 ;; Copyright (c) 2015 Athur Fayzrakhmanov
@@ -313,6 +321,7 @@ STORE-PREVIOUS is non-nil, note the caller's buffer in
              (eq this-command 'mafia-repl-mode))
     (error "You probably meant to run: M-x mafia-repl"))
   (setq-local comint-prompt-regexp mafia-prompt-regexp)
+  (eval-when-compile (defvar warning-suppress-types)) ;; clear erroneous warning
   (setq-local warning-suppress-types (cons '(undo discard-info) warning-suppress-types))
   ;; (add-hook 'comint-output-filter-functions ;; comint - makes buffer hyperlinks from repl output
   ;;           'intero-linkify-process-output
