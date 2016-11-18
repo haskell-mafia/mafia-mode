@@ -26,18 +26,24 @@ Here is a list of the various glaring holes, if you'd like to contribute:
   - [ ] Add buffer to a different repl (e.g. load Test.P.Bool in the
     `p` repl, rather than `p-test`)
   - [ ] Work properly for standalone Haskell files (outside projects)
+  - [ ] Some kind of support for GHC version hopping
 - [ ] Type at point
   - [ ] Configurable alternative GHCi invocations, e.g. `intero`,
     `ghci`, `cabal repl`, `stack ghci`
   - [ ] Port across the regexes from intero.el
   - [ ] Keep the repl buffer hidden
 - [ ] Build and test support
+  - [ ] Build in separate process buffer
+  - [ ] Test in separate process buffer
+  - [ ] Report errors
+  - [ ] Projectile support (build project, etc)
 - [ ] Flycheck support
   - [ ] Port across the regexes from intero.el
   - [ ] ???
-- [ ] Company support
+- [ ] Company support (type-directed code completion)
   - [ ] Port across the regexes from intero.el
 - [ ] Proper error handling
+  - [ ] Handle tools missing on path
 - [ ] Spacemacs layer
 
 ## Usage
