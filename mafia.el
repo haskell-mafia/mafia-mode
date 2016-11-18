@@ -255,7 +255,7 @@ CABAL-FILE rather than trying to locate one."
                                         (eq 'splice (flycheck-error-level msg)))
                                       msgs))
                (when compile-ok
-                 (intero-async-call 'backend
+                 (mafia-async-call 'backend
                                     (concat ":m + "
                                             (replace-regexp-in-string modules "," ""))
                                     nil
@@ -673,7 +673,8 @@ as (CALLBACK STATE REPLY)."
 
 (defun mafia-buffer (worker &optional targets)
   "Get the WORKER buffer for the current directory."
-  (let ((buffer (mafia-get-buffer-create worker)))
+  (let ((buffer (mafia-get-buffer-create worker))
+        (targets (mafia-targets)))
     (if (get-buffer-process buffer)
         buffer
       (mafia-get-worker-create worker targets (current-buffer)))))
