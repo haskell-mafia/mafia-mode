@@ -33,7 +33,7 @@
 
 ;; None of these currently needed
 ;;(require 'json)
-;;(require 'warnings)
+(require 'warnings)
 ;;(require 'cl-lib)
 ;;(require 'company)
 ;;
