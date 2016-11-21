@@ -8,7 +8,7 @@
 ;; Created: 18th November 2016
 ;; Version: 0.1.13
 ;; Keywords: haskell, tools
-;; Package-Requires: ((emacs "24.3"))
+;; Package-Requires: ((emacs "24.3") (flycheck "0.25"))
 
 ;; Copyright (c) 2016 Ambiata
 ;; Copyright (c) 2016 Chris Done
@@ -41,6 +41,7 @@
 ;;(require 'eldoc)
 
 (require 'comint)
+(require 'flycheck)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Modes
@@ -64,12 +65,13 @@
       (interactive-haskell-mode -1)))
   (if mafia-mode
     (message "mafia mode enabled.")
-;;      (progn (flycheck-select-checker 'intero)
-;;             (flycheck-mode)
+      (progn (flycheck-select-checker 'mafia)
+             (flycheck-mode)
+             (message "mafia mode disabled."))))
 ;;             (add-to-list (make-local-variable 'company-backends) 'company-intero)
 ;;             (company-mode)
 ;;             (setq-local eldoc-documentation-function 'eldoc-intero))
-    (message "mafia mode disabled.")))
+
 
 (define-key mafia-mode-map (kbd "C-c C-z") 'mafia-repl)
 (define-key mafia-mode-map (kbd "C-c C-a") 'mafia-repl-add)
@@ -128,6 +130,13 @@ create a fresh one without this variable enabled.")
 
 (defvar-local mafia-callbacks (list)
   "List of callbacks waiting for output. LIST is a FIFO.")
+
+(defvar-local mafia-suggestions nil
+  "Auto actions for the buffer.")
+
+(defvar-local mafia-extensions nil
+  "Extensions supported by the compiler.")
+
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -213,6 +222,297 @@ CABAL-FILE rather than trying to locate one."
   (or mafia-targets
       (setq mafia-targets
         (list (buffer-file-name (current-buffer))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; FLYCHECK
+
+(defun mafia-check (checker cont)
+  "Run a check with CHECKER and pass the status onto CONT."
+  (if (mafia-gave-up 'backend)
+      (run-with-timer 0
+                      nil
+                      cont
+                      'interrupted)
+    (let ((file-buffer (current-buffer)))
+      (mafia-async-call
+       'backend
+       (concat ":l " (mafia-temp-file-name)) ;; this looks suspicious
+       (list :cont cont
+             :file-buffer file-buffer
+             :checker checker)
+       (lambda (state string)
+         (let ((compile-ok (string-match "OK, modules loaded: \\(.*\\)\\.$" string)))
+           (with-current-buffer (plist-get state :file-buffer)
+             (let ((modules (match-string 1 string))
+                   (msgs (mafia-parse-errors-warnings-splices
+                          (plist-get state :checker)
+                          (current-buffer)
+                          string)))
+               (mafia-collect-compiler-messages msgs)
+               (funcall (plist-get state :cont)
+                        'finished
+                        (cl-remove-if (lambda (msg)
+                                        (eq 'splice (flycheck-error-level msg)))
+                                      msgs))
+               (when compile-ok
+                 (mafia-async-call 'backend
+                                    (concat ":m + "
+                                            (replace-regexp-in-string modules "," ""))
+                                    nil
+                                    (lambda (_st _))))))))))))
+
+(flycheck-define-generic-checker 'mafia
+  "A syntax and type checker for Haskell using an Mafia worker
+process."
+  :start 'mafia-check
+  :modes '(haskell-mode literate-haskell-mode))
+
+(add-to-list 'flycheck-checkers 'mafia)
+
+(defun mafia-parse-errors-warnings-splices (checker buffer string)
+  "Parse flycheck errors and warnings.
+CHECKER and BUFFER are added to each item parsed from STRING."
+  (with-temp-buffer
+    (insert string)
+    (goto-char (point-min))
+    (let ((messages (list))
+          (temp-file (mafia-temp-file-name buffer)))
+      (while (search-forward-regexp
+              (concat "[\r\n]\\([A-Z]?:?[^ \r\n:][^:\n\r]+\\):\\([0-9()-:]+\\):"
+                      "[ \n\r]+\\([[:unibyte:][:nonascii:]]+?\\)\n[^ ]")
+              nil t 1)
+        (let* ((file (match-string 1))
+               (location-raw (match-string 2))
+               (msg (match-string 3)) ;; Replace gross bullet points.
+               (type (cond ((string-match "^Warning:" msg)
+                            (setq msg (replace-regexp-in-string "^Warning: *" "" msg))
+                            (if (string-match "^\\[-Wdeferred-type-errors\\]" msg)
+                                'error
+                              'warning))
+                           ((string-match "^Splicing " msg) 'splice)
+                           (t                               'error)))
+               (location (mafia-parse-error
+                          (concat file ":" location-raw ": x")))
+               (line (plist-get location :line))
+               (column (plist-get location :col)))
+          (setq messages
+                (cons (flycheck-error-new-at
+                       line column type
+                       msg
+                       :checker checker
+                       :buffer (when (string= temp-file file)
+                                 buffer)
+                       :filename (buffer-file-name buffer))
+                      messages)))
+        (forward-line -1))
+      (delete-dups messages))))
+
+(defconst mafia-error-regexp-alist
+  `((,(concat
+       "^ *\\(?1:[^\t\r\n]+?\\):"
+       "\\(?:"
+       "\\(?2:[0-9]+\\):\\(?4:[0-9]+\\)\\(?:-\\(?5:[0-9]+\\)\\)?" ;; "121:1" & "12:3-5"
+       "\\|"
+       "(\\(?2:[0-9]+\\),\\(?4:[0-9]+\\))-(\\(?3:[0-9]+\\),\\(?5:[0-9]+\\))" ;; "(289,5)-(291,36)"
+       "\\)"
+       ":\\(?6: Warning:\\)?")
+     1 (2 . 3) (4 . 5) (6 . nil)) ;; error/warning locus
+
+    ;; multiple declarations
+    ("^    \\(?:Declared at:\\|            \\) \\(?1:[^ \t\r\n]+\\):\\(?2:[0-9]+\\):\\(?4:[0-9]+\\)$"
+     1 2 4 0) ;; info locus
+
+    ;; this is the weakest pattern as it's subject to line wrapping et al.
+    (" at \\(?1:[^ \t\r\n]+\\):\\(?2:[0-9]+\\):\\(?4:[0-9]+\\)\\(?:-\\(?5:[0-9]+\\)\\)?[)]?$"
+     1 2 (4 . 5) 0)) ;; info locus
+  "Regexps used for matching GHC compile messages.")
+
+(defun mafia-parse-error (string)
+  "Parse the line number from the error in STRING."
+  (let ((span nil))
+    (cl-loop for regex
+             in mafia-error-regexp-alist
+             do (when (string-match (car regex) string)
+                  (setq span
+                        (list :file (match-string 1 string)
+                              :line (string-to-number (match-string 2 string))
+                              :col (string-to-number (match-string 4 string))
+                              :line2 (when (match-string 3 string)
+                                       (string-to-number (match-string 3 string)))
+                              :col2 (when (match-string 5 string)
+                                      (string-to-number (match-string 5 string)))))))
+    span))
+
+
+(defun mafia-call-in-buffer (buffer func &rest args)
+  "In BUFFER, call FUNC with ARGS."
+  (with-current-buffer buffer
+    (apply func args)))
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Collecting information from compiler messages
+
+(defun mafia-collect-compiler-messages (msgs) ;; crikey
+  "Collect information from compiler MSGS.
+
+This may update in-place the MSGS objects to hint that
+suggestions are available."
+  (setq mafia-suggestions nil)
+  (let ((extension-regex (regexp-opt (mafia-extensions)))
+        (quoted-symbol-regex "[‘`‛]\\([^ ]+\\)['’]"))
+    (cl-loop
+     for msg in msgs
+     do (let ((text (flycheck-error-message msg))
+              (note nil))
+          ;; Messages of this format:
+          ;;
+          ;; Can't make a derived instance of ‘Functor X’:
+          ;;       You need DeriveFunctor to derive an instance for this class
+          ;;       Try GeneralizedNewtypeDeriving for GHC's newtype-deriving extension
+          ;;       In the newtype declaration for ‘X’
+          (let ((start 0))
+            (while (string-match extension-regex text start)
+              (setq note t)
+              (add-to-list 'mafia-suggestions
+                           (list :type 'add-extension
+                                 :extension (match-string 0 text)))
+              (setq start (min (length text) (1+ (match-end 0))))))
+          ;; Messages of this format:
+          ;;
+          ;; Defaulting the following constraint(s) to type ‘Integer’
+          ;;   (Num a0) arising from the literal ‘1’
+          ;; In the expression: 2
+          ;; In an equation for ‘x'’: x' = 2
+          (let ((start 0))
+            (while (string-match
+                    " Defaulting the following constraint" text start)
+              (setq note t)
+              (add-to-list 'mafia-suggestions
+                           (list :type 'add-ghc-option
+                                 :option "-fno-warn-type-defaults"))
+              (setq start (min (length text) (1+ (match-end 0))))))
+          ;; Messages of this format:
+          ;;
+          ;;     This binding for ‘x’ shadows the existing binding
+          (let ((start 0))
+            (while (string-match
+                    " This binding for ‘\\(.*\\)’ shadows the existing binding" text start)
+              (setq note t)
+              (add-to-list 'mafia-suggestions
+                           (list :type 'add-ghc-option
+                                 :option "-fno-warn-name-shadowing"))
+              (setq start (min (length text) (1+ (match-end 0))))))
+          ;; Messages of this format:
+          ;;
+          ;; The import of ‘Control.Monad’ is redundant
+          ;;   except perhaps to import instances from ‘Control.Monad’
+          ;; To import instances alone, use: import Control.Monad()... (intero)
+          (when (string-match
+                 " The \\(qualified \\)?import of[ ][‘`‛]\\([^ ]+\\)['’] is redundant"
+                 text)
+            (setq note t)
+            (add-to-list 'mafia-suggestions
+                         (list :type 'remove-import
+                               :module (match-string 2 text)
+                               :line (flycheck-error-line msg))))
+          ;; Messages of this format:
+          ;;
+          ;; Not in scope: ‘putStrn’
+          ;; Perhaps you meant one of these:
+          ;;   ‘putStr’ (imported from Prelude),
+          ;;   ‘putStrLn’ (imported from Prelude)
+          ;;
+          ;; Or this format:
+          ;;
+          ;; error:
+          ;;    • Variable not in scope: lopSetup :: [Statement Exp']
+          ;;    • Perhaps you meant ‘loopSetup’ (line 437)
+          (when (string-match
+                 "[Nn]ot in scope: \\(data constructor \\|type constructor or class \\)?[‘`‛]?\\([^'’ ]+\\).*\n.*Perhaps you meant"
+                 text)
+            (let ((typo (match-string 2 text))
+                  (start (min (length text) (1+ (match-end 0)))))
+              (while (string-match quoted-symbol-regex text start)
+                (setq note t)
+                (add-to-list 'mafia-suggestions
+                             (list :type 'fix-typo
+                                   :typo typo
+                                   :replacement (match-string 1 text)
+                                   :column (flycheck-error-column msg)
+                                   :line (flycheck-error-line msg)))
+                (setq start (min (length text) (1+ (match-end 0)))))))
+          ;; Messages of this format:
+          ;;
+          ;;     Top-level binding with no type signature: main :: IO ()
+          (when (string-match
+                 "Top-level binding with no type signature:"
+                 text)
+            (let ((start (min (length text) (match-end 0))))
+              (setq note t)
+              (add-to-list 'mafia-suggestions
+                           (list :type 'add-signature
+                                 :signature (mapconcat #'identity (split-string (substring text start)) " ")
+                                 :line (flycheck-error-line msg)))))
+          ;; Messages of this format:
+          ;;
+          ;;     Redundant constraints: (Arith var, Bitwise var)
+          ;; Or
+          ;;     Redundant constraint: Arith var
+          ;; Or
+          ;;     Redundant constraints: (Arith var,
+          ;;                             Bitwise var,
+          ;;                             Functor var,
+          ;;                             Applicative var,
+          ;;                             Monad var)
+          (when (string-match "Redundant constraints?: " text)
+            (let* ((redundant-start (match-end 0))
+                   (parts (with-temp-buffer
+                            (insert (substring text redundant-start))
+                            (goto-char (point-min))
+                            ;; A lone unparenthesized constraint might
+                            ;; be multiple sexps.
+                            (while (not (eq (point) (point-at-eol)))
+                              (forward-sexp))
+                            (let ((redundant-end (point)))
+                              (search-forward-regexp ".*\n.*In the ")
+                              (cons (buffer-substring (point-min) redundant-end)
+                                    (buffer-substring (match-end 0) (point-max)))))))
+              (setq note t)
+              (add-to-list
+               'mafia-suggestions
+               (let ((rest (cdr parts))
+                     (redundant (let ((raw (car parts)))
+                                  (if (eq (string-to-char raw) ?\()
+                                      (substring raw 1 (1- (length raw)))
+                                    raw))))
+                 (list :type 'redundant-constraint
+                       :redundancies (mapcar #'string-trim
+                                             (intero-parse-comma-list redundant))
+                       :signature (mapconcat #'identity (split-string rest) " ")
+                       :line (flycheck-error-line msg))))))
+          ;; Add a note if we found a suggestion to make
+          (when note
+            (setf (flycheck-error-message msg)
+                  (concat text
+                          "\n\n"
+                          (propertize "(Hit `C-c C-????' in the Haskell buffer to apply suggestions)" ;; TODO TODO TODO
+                                      'face 'font-lock-warning-face)))))))
+  (setq intero-lighter
+        (if (null mafia-suggestions)
+            " Mafia"
+          (format " Mafia:%d" (length mafia-suggestions)))))
+
+
+(defun mafia-extensions ()
+  "Get extensions for the current project's GHC."
+  (with-current-buffer (mafia-buffer 'backend)
+    (or mafia-extensions
+        (setq mafia-extensions
+              (split-string
+               (shell-command-to-string
+                "ghc --supported-extensions"))))))
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; REPL
@@ -352,9 +652,29 @@ If PROMPT-OPTIONS is non-nil, prompt with an options list."
                          (match-end 1)
                          ?λ))))))
 
+
+(defun mafia-async-call (worker cmd &optional state callback)
+  "Send WORKER the command string CMD.
+The result, along with the given STATE, is passed to CALLBACK
+as (CALLBACK STATE REPLY)."
+  (let ((buffer (mafia-buffer worker)))
+    (if (and buffer (process-live-p (get-buffer-process buffer)))
+        (progn (with-current-buffer buffer
+                 (setq mafia-callbacks
+                       (append mafia-callbacks
+                               (list (list state
+                                           (or callback #'ignore)
+                                           cmd)))))
+               (when mafia-debug
+                 (message "[Mafia] -> %s" cmd))
+               (comint-simple-send (mafia-process worker) cmd))
+      (error "Mafia process is not running: run M-x intero-restart to start it")))) ;; TODO
+
+
 (defun mafia-buffer (worker &optional targets)
   "Get the WORKER buffer for the current directory."
-  (let ((buffer (mafia-get-buffer-create worker)))
+  (let ((buffer (mafia-get-buffer-create worker))
+        (targets (mafia-targets)))
     (if (get-buffer-process buffer)
         buffer
       (mafia-get-worker-create worker targets (current-buffer)))))
@@ -369,6 +689,10 @@ If PROMPT-OPTIONS is non-nil, prompt with an options list."
             package-name
             " "
             root)))
+
+(defun mafia-process (worker)
+  "Get the WORKER process for the current directory."
+  (get-buffer-process (mafia-buffer worker)))
 
 (defun mafia-get-worker-create (worker &optional targets source-buffer)
   "Start the given WORKER.
@@ -517,6 +841,18 @@ The process ended. Here is the reason that Emacs gives us:
 
      (format "  pwd: %s" (shell-command-to-string "pwd")))
     'face 'compilation-error)))
+
+
+(defun mafia-gave-up (worker)
+  "Return non-nil if starting WORKER or installing intero failed."
+  (and (mafia-buffer-p worker)
+       (let ((buffer (get-buffer (mafia-buffer-name worker))))
+         (buffer-local-value 'mafia-give-up buffer))))
+
+
+(defun mafia-buffer-p (worker)
+  "Return non-nil if a buffer exists for WORKER."
+  (get-buffer (mafia-buffer-name worker)))
 
 
 (defun mafia--warn (message &rest args)
