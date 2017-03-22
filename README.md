@@ -54,8 +54,8 @@ For now, you need `mafia` and `ghc` on your PATH.
 
 ```elisp
 (add-to-list 'load-path "~/.emacs.d/mafia-mode/")
-(require 'mafia)
-(add-hook 'haskell-mode-hook #'mafia-mode)
+(require 'dante)
+(add-hook 'haskell-mode-hook #dante-mode)
 ```
 
 Open a file inside a Haskell project, then hit `C-c C-z` to boot up a
